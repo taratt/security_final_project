@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
+from sympy import print_rcode
+
 from .layerwrapper import WrappedGPT
 from .data import get_loaders 
-
-
+import random
+import numpy as np
 
 def find_layers(module, layers=[nn.Linear], name=''):
     """
@@ -25,32 +27,6 @@ def find_layers(module, layers=[nn.Linear], name=''):
             child, layers=layers, name=name + '.' + name1 if name != '' else name1
         ))
     return res
-
-def check_sparsity(model):
-    use_cache = model.config.use_cache 
-    model.config.use_cache = False 
-
-    layers = model.model.decoder.layers
-    count = 0 
-    total_params = 0
-    for i in range(len(layers)):
-        layer = layers[i]
-        subset = find_layers(layer)
-
-        sub_count = 0
-        sub_params = 0
-        for name in subset:
-            W = subset[name].weight.data
-            count += (W==0).sum().item()
-            total_params += W.numel()
-
-            sub_count += (W==0).sum().item()
-            sub_params += W.numel()
-
-        print(f"layer {i} sparsity {float(sub_count)/sub_params:.6f}")
-
-    model.config.use_cache = use_cache 
-    return float(count)/total_params 
 
 def prepare_calibration_input(model, dataloader, device):
     use_cache = model.config.use_cache
@@ -88,21 +64,33 @@ def prepare_calibration_input(model, dataloader, device):
 
     return inps, outs, attention_mask
 
-def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
-    thres_cumsum = sum_before * alpha 
-    sort_mask = tmp_metric <= thres_cumsum.reshape((-1,1))
-    thres = torch.gather(sort_res[0], dim=1, index=sort_mask.sum(dim=1, keepdims=True)-1)
-    W_mask = (W_metric <= thres)
-    cur_sparsity = (W_mask==True).sum() / W_mask.numel()
-    return W_mask, cur_sparsity
+
+def bfa(element):
+    binary_representation = element.view(torch.uint16).item()
+    bit_to_flip = random.randint(0, 15)
+    flipped_binary = binary_representation ^ (1 << bit_to_flip)
+    flipped_value = torch.tensor(flipped_binary, dtype=torch.uint16).view(torch.float16)
+
+    return flipped_value
 
 
+def perform_bfa_on_weights(weight, percentage):
+    flat_weight = weight.flatten()
+    num_elements = flat_weight.numel()
+    num_to_double = int((percentage / 100) * num_elements)
 
-def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    indices_to_attack= torch.randperm(num_elements)[:num_to_double]
+    for i, idx in enumerate(indices_to_attack):
+        flat_weight[idx] = bfa(flat_weight[idx])
+
+    return flat_weight.view(weight.shape)
+
+
+def perform_attack(args, model, tokenizer, device=torch.device("cuda:0"), bit_flip_percentage=1):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
-    print("loading calibdation data")
+    print("loading calibration data")
     dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
@@ -113,7 +101,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         layer = layers[i]
         subset = find_layers(layer)
 
-        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+        if f"model.layers.{i}" in model.hf_device_map:
             dev = model.hf_device_map[f"model.layers.{i}"]
             inps, outs, attention_mask = inps.to(dev), outs.to(dev), attention_mask.to(dev)
 
@@ -136,24 +124,10 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             h.remove()
 
         for name in subset:
-            print(f"pruning layer {i} name {name}")
-            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
+            print(f"Attacking layer {i} name {name}")
 
-            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
-            if prune_n != 0:
-                # structured n:m sparsity
-                for ii in range(W_metric.shape[1]):
-                    if ii % prune_m == 0:
-                        tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
-            else:
-                sort_res = torch.sort(W_metric, dim=-1, stable=True)
+            subset[name].weight.data = perform_bfa_on_weights(subset[name].weight.data, bit_flip_percentage)
 
-                # unstructured pruning
-                indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
-                W_mask.scatter_(1, indices, True)
-
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
 
         for j in range(args.nsamples):
             with torch.no_grad():

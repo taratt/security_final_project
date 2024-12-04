@@ -6,6 +6,8 @@ from .layerwrapper import WrappedGPT
 from .data import get_loaders
 import random
 import numpy as np
+import time
+
 
 
 def find_layers(module, layers=[nn.Linear], name=''):
@@ -71,10 +73,14 @@ def prepare_calibration_input(model, dataloader, device):
 
 def bfa(element):
     binary_representation = element.view(torch.uint16).item()
-    bit_to_flip = random.randint(0, 9)
+    bit_to_flip = random.randint(0, 15)
+    # if bit_to_flip > 9:
+    #     print("lo ", element)
     flipped_binary = binary_representation ^ (1 << bit_to_flip)
     flipped_value = torch.tensor(flipped_binary, dtype=torch.uint16).view(torch.float16)
-
+    # if bit_to_flip > 9:
+    #     print("ygf",flipped_value)
+    #     print("bfa",bit_to_flip)
     return flipped_value
 
 
@@ -89,9 +95,61 @@ def perform_bfa_on_weights(weight, percentage):
 
     return flat_weight.view(weight.shape)
 
+def flip_bit(element, exponent_bit):
+    # print("element", element)
+    binary_representation = element.view(torch.uint16).item()
+    flipped_binary = binary_representation ^ (1 << exponent_bit+10)
+    flipped_value = torch.tensor(flipped_binary, dtype=torch.uint16).view(torch.float16)
+    # print("defended",flipped_value)
+    return flipped_value
+
+def get_anomaly_indices(weight, bit):
+    mask = torch.zeros_like(weight, dtype=torch.bool)
+    mask[:, 1:] |= (torch.abs(weight[:, 1:]) > 2 ** bit * torch.abs(weight[:, :-1])) | \
+                    (torch.abs(weight[:, 1:]) < torch.abs(weight[:, :-1]) / 2 ** bit)
+
+    mask[:, :-1] &= (torch.abs(weight[:, :-1]) > 2 ** bit * torch.abs(weight[:, 1:])) | \
+                     (torch.abs(weight[:, :-1]) < torch.abs(weight[:, 1:] / 2 ** bit))
+
+    final_mask = mask[:, 1:] & mask[:, :-1]
+
+    indices = torch.nonzero(final_mask)
+    return indices
+
 def flip_defend(weight):
 
-    pass
+    indices = (weight > 1) | (weight < -1)
+    selected_indices = torch.nonzero(indices, as_tuple=False)
+    if len(selected_indices) != 0:
+        for idx in selected_indices:
+
+            element = weight[idx[0].item(), idx[1].item()]
+            abs_element = abs(element)
+            if abs_element < 2 and abs_element > 1.5:
+                weight[idx[0].item(), idx[1].item()]= flip_bit(element, 0)
+            if abs_element < 4 and abs_element > 2:
+                weight[idx[0].item(), idx[1].item()]= flip_bit(element, 2)
+            elif abs_element < 256 and abs_element > 4:
+                weight[idx[0].item(), idx[1].item()] = flip_bit(element, 3)
+            elif  abs_element > 256:
+                weight[idx[0].item(), idx[1].item()] = flip_bit(element, 4)
+
+
+    # indices8 = get_anomaly_indices(weight, 10)
+    # indices16 = get_anomaly_indices(weight, 16)
+    # indices32 = get_anomaly_indices(weight, 28)
+    # for idx in indices32:
+    #     element = weight[idx[0].item(), idx[1].item()]
+    #     weight[idx[0].item(), idx[1].item()] = flip_bit(element, 4)
+    # for idx in indices16:
+    #     element = weight[idx[0].item(), idx[1].item()]
+    #     if idx not in indices32:
+    #         weight[idx[0].item(), idx[1].item()] = flip_bit(element, 3)
+    # for idx in indices8:
+    #     if idx not in indices16 and idx not in indices32:
+    #         element = weight[idx[0].item(), idx[1].item()]
+    #         weight[idx[0].item(), idx[1].item()] = flip_bit(element, 2)
+
 
 def compare_and_print_differences(tensor1, tensor2):
     """
@@ -153,10 +211,10 @@ def perform_attack(args, model, tokenizer, device=torch.device("cuda:0"), bit_fl
         #     h.remove()
 
         for name in subset:
-
+            #time.sleep(1)
             print(f"Attacking layer {i} name {name}")
-           # org = subset[name].weight.data.clone()
-
+            #org = subset[name].weight.data.clone()
+            #print(org)
             if atten and (name == "self_attn.k_proj" or name == "self_attn.q_proj" or name == "self_attn.v_proj"):
                 subset[name].weight.data = perform_bfa_on_weights(subset[name].weight.data, bit_flip_percentage)
             if atten_out and (name == "self_attn.out_proj"):
@@ -187,6 +245,7 @@ def perform_attack(args, model, tokenizer, device=torch.device("cuda:0"), bit_fl
 
                 #prune defence
                 #subset[name].weight.data[subset[name].weight.data>1] = 0
+                #time.sleep(1)
                 flip_defend(subset[name].weight.data)
             #compare_and_print_differences(subset[name].weight.data, org)
 
